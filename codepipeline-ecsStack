@@ -1,0 +1,260 @@
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { CfnConnection } from "aws-cdk-lib/aws-codestarconnections";
+import * as codepipeline from 'aws-cdk-lib/aws-codepipeline';
+import * as codepipeline_actions from 'aws-cdk-lib/aws-codepipeline-actions';
+import * as codebuild from 'aws-cdk-lib/aws-codebuild';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
+import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import { Duration } from 'aws-cdk-lib';
+import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as ecr from 'aws-cdk-lib/aws-ecr';
+import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
+
+export class DocumentscodepipelineStack extends cdk.Stack {
+  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+    super(scope, id, props);
+
+    const existingKeyPair = ec2.KeyPair.fromKeyPairName(this, 'ExistingKeyPair', 'docker key');
+
+    // Create ECR Repository
+    const ecrRepo = ecr.Repository.fromRepositoryName(this, 'MyEcrRepo', 'broadlume001');
+
+    // Create a GitHub connection
+    const ghConnection = new CfnConnection(this, 'CDK50GHConnection', {
+      connectionName: "Broadlume-github001",
+      providerType: "GitHub"
+    });
+
+    // Create a CodePipeline
+    const pipeline = new codepipeline.Pipeline(this, 'Pipeline', {
+      pipelineName: 'Broadlume001',
+    });
+
+    // Define the source stage
+    const sourceOutput = new codepipeline.Artifact();
+    const sourceAction = new codepipeline_actions.CodeStarConnectionsSourceAction({
+      actionName: 'GitHub_Source',
+      owner: 'MohammedAleemuddin', // Replace with your GitHub owner
+      repo: 'dns-demo', // Replace with your GitHub repository
+      branch: 'main', // Replace with your desired branch
+      output: sourceOutput,
+      connectionArn: ghConnection.attrConnectionArn,
+    });
+    const sourceStage = pipeline.addStage({ stageName: 'Source' });
+    sourceStage.addAction(sourceAction);
+
+    // Define the build stage
+    const buildOutput = new codepipeline.Artifact();
+
+    // Build manual approval stage
+    const buildManualApprovalAction = new codepipeline_actions.ManualApprovalAction({
+      actionName: 'BuildManualApproval',
+      runOrder: 1, // Set the order in which this action should run
+    });
+
+    // Build project Stage
+    const buildProject = new codebuild.PipelineProject(this, 'BuildProject', {
+      buildSpec: codebuild.BuildSpec.fromSourceFilename('buildspec.yml'), // Replace with your buildspec file
+      environment: {
+        buildImage: codebuild.LinuxBuildImage.AMAZON_LINUX_2_5,
+        privileged: true, // Required for Docker builds
+      },
+      environmentVariables: {
+        'ECR_REPO_URI': { value: ecrRepo.repositoryUri },
+      }
+    });
+    ecrRepo.grantPullPush(buildProject.role!);
+    
+    // Build Action  
+    const buildAction = new codepipeline_actions.CodeBuildAction({
+      actionName: 'Build',
+      project: buildProject,
+      input: sourceOutput,
+      outputs: [buildOutput],
+      runOrder: 2,
+    });
+    const buildStage = pipeline.addStage({ stageName: 'Build' });
+    buildStage.addAction(buildManualApprovalAction);
+    buildStage.addAction(buildAction);
+
+    // Create a VPC
+    const vpc = new ec2.Vpc(this, 'MyVpc', {
+      vpcName: 'Broadlumevpc001',
+      maxAzs: 2,
+    });
+
+   // Security group for Ecs-ec2 instance
+    const ecsSecurityGroup = new ec2.SecurityGroup(this, 'EcsSecurityGroup', {
+      vpc,
+      allowAllOutbound: true,
+      description: 'Security group for ECS EC2 instances',
+    });
+    
+    // Allow inbound traffic from the load balancer on ports 80 and 443
+    ecsSecurityGroup.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80),
+      'Allow inbound HTTP traffic from the load balancer'
+    );
+    ecsSecurityGroup.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(443),
+      'Allow inbound HTTPS traffic from the load balancer'
+    );
+
+    // Allow all inbound traffic
+   ecsSecurityGroup.addIngressRule(
+     ec2.Peer.anyIpv4(),
+     ec2.Port.allTraffic(),
+     'Allow all inbound traffic'
+   );
+
+    // Create an ECS cluster
+    const cluster = new ecs.Cluster(this, 'MyCluster', {
+      vpc: vpc,
+      clusterName: 'Braodlume-cluster001'
+    });
+
+    const autoScalingGroup = new autoscaling.AutoScalingGroup(this, 'EcsAutoScalingGroup', {
+      vpc,
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.SMALL),
+      machineImage: ecs.EcsOptimizedImage.amazonLinux2(),
+      minCapacity: 2,
+      maxCapacity: 5,
+      desiredCapacity: 2,
+      securityGroup: ecsSecurityGroup,
+      autoScalingGroupName: 'Broadlumescalegroup001',
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC }, // Use public subnets
+      associatePublicIpAddress: true, // Assign public IP addresses
+      keyName: existingKeyPair.keyPairName,
+    });
+    const capacityProvider = new ecs.AsgCapacityProvider(this, 'AsgCapacityProvider', {
+      autoScalingGroup,
+    });
+    cluster.addAsgCapacityProvider(capacityProvider);
+    
+
+    // Create IAM Role for ECS Tasks
+     const taskRole = new iam.Role(this, 'MyTaskRole', {
+     assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
+});
+
+// Add policy to allow EC2 instances to pull from ECR (if needed)
+  taskRole.addToPolicy(new iam.PolicyStatement({
+  actions: ['ecr:GetAuthorizationToken', 'ecr:BatchCheckLayerAvailability', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchGetImage', 'logs:CreateLogStream', 'logs:PutLogEvents'],
+  resources: ['*'],
+ }));
+    // Define your task definition
+    const taskDefinition = new ecs.TaskDefinition(this, 'Broadlume-TaskDefinition001', {
+      compatibility: ecs.Compatibility.EC2,
+      cpu: '512',
+      memoryMiB: '1024',
+      taskRole: taskRole,
+    });
+
+    // CloudWatch logs for container image
+    const logging = new ecs.AwsLogDriver({ streamPrefix: 'broadlumecontainerlog' });
+
+    // Add a container to your task definition
+    const container = taskDefinition.addContainer('MyContainer', {
+      image: ecs.ContainerImage.fromEcrRepository(ecrRepo, 'latest'), 
+      cpu: 512,
+      memoryLimitMiB: 1024,
+      logging,
+    });
+    container.addPortMappings({
+      containerPort: 80,
+    });
+
+    const service = new ecs.Ec2Service(this, 'BroadlumeService001', { 
+      cluster, 
+      taskDefinition, 
+      desiredCount:1,
+      serviceName: 'broadlumeService001'
+    });
+
+    // Security group for Loadbalanceer
+    const albSecurityGroup = new ec2.SecurityGroup(this, 'AlbSecurityGroup', {
+      vpc,
+      allowAllOutbound: true,
+      description: 'Security group for the Application Load Balancer',
+      securityGroupName: 'BroadlumeALB001'
+    });
+    
+    // Allow inbound traffic on ports 80 and 443 from anywhere
+    albSecurityGroup.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80),
+      'Allow inbound HTTP traffic'
+    );
+    albSecurityGroup.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(443),
+      'Allow inbound HTTPS traffic'
+    );
+
+    const alb = new elbv2.ApplicationLoadBalancer(this, 'ALB', {
+      vpc,
+      internetFacing: true, // assuming you want a publicly accessible ALB
+      securityGroup: albSecurityGroup, // Associate the security group with the load balancer
+      loadBalancerName: 'Broadlume-ALB001'
+    });
+    
+    
+    const listener = alb.addListener('Broadlume-listener001', {
+      port: 80,
+      open: true,
+    });
+    
+    // Use the security group of the ECS EC2 instances for the target group
+    const targetGroup = new elbv2.ApplicationTargetGroup(this, 'TargetGroup', {
+    vpc,
+    port: 80,
+    targets: [service],
+    protocol: elbv2.ApplicationProtocol.HTTP,
+    targetType: elbv2.TargetType.INSTANCE, // Use INSTANCE target type for EC2 service
+});
+    // Add the target group to the listener
+    listener.addTargetGroups('TargetGroup', {
+    targetGroups: [targetGroup],
+   });
+    // Define the IAM role for CodePipeline
+    const pipelineRole = new iam.Role(this, 'PipelineRole', {
+      assumedBy: new iam.ServicePrincipal('codepipeline.amazonaws.com'),
+    });
+    // Attach the AWSCodeDeployFullAccess managed policy to the IAM role
+    pipelineRole.addManagedPolicy(iam.ManagedPolicy.fromAwsManagedPolicyName('AWSCodeDeployFullAccess'));
+
+    pipelineRole.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'codepipeline:GetPipelineState',
+          'codepipeline:GetPipelineExecution',
+          'codepipeline:PutApprovalResult',
+          's3:PutObject',
+          's3:GetObject',
+          's3:GetObjectVersion',
+          's3:GetBucketVersioning',
+          's3:ListBucket',
+        ],
+        resources: ['*'],
+      })
+    );
+
+    // Add a new stage to the CodePipeline for ECS deployment
+    const deployStage = pipeline.addStage({
+      stageName: 'Deploy',
+      actions: [
+        new codepipeline_actions.EcsDeployAction({
+          actionName: 'DeployAction',
+          service: service,
+          input: buildOutput,
+          deploymentTimeout: Duration.minutes(60), // optional, default is 60 minutes
+        }),
+      ],
+    });
+  }
+}
