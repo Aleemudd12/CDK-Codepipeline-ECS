@@ -16,10 +16,16 @@ export class DocumentscodepipelineStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    const existingKeyPair = ec2.KeyPair.fromKeyPairName(this, 'ExistingKeyPair', 'docker key');
+    const existingKeyPair = ec2.KeyPair.fromKeyPairName(this, 'ExistingKeyPair', 'docker key'); //change the keypair name with existing key like 'docker key'
 
     // Create ECR Repository
-    const ecrRepo = ecr.Repository.fromRepositoryName(this, 'MyEcrRepo', 'broadlume001');
+    //const ecrRepo = ecr.Repository.fromRepositoryName(this, 'MyEcrRepo', 'broadlume001'); // (this is use for existing ecr repo)
+
+    // Create New ECR Repository
+    const ecrRepo = new ecr.Repository(this, 'EcrRepo', {
+      repositoryName: 'my-ecr-repo', // Replace with your desired ECR repository name
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
 
     // Create a GitHub connection
     const ghConnection = new CfnConnection(this, 'CDK50GHConnection', {
@@ -54,7 +60,7 @@ export class DocumentscodepipelineStack extends cdk.Stack {
       runOrder: 1, // Set the order in which this action should run
     });
 
-    // Build project Stage
+    // Build project Stage and buildspec.yml file require to run the project
     const buildProject = new codebuild.PipelineProject(this, 'BuildProject', {
       buildSpec: codebuild.BuildSpec.fromSourceFilename('buildspec.yml'), // Replace with your buildspec file
       environment: {
@@ -65,9 +71,9 @@ export class DocumentscodepipelineStack extends cdk.Stack {
         'ECR_REPO_URI': { value: ecrRepo.repositoryUri },
       }
     });
-    ecrRepo.grantPullPush(buildProject.role!);
+    ecrRepo.grantPullPush(buildProject.role!); //grant pull and push permission of code
     
-    // Build Action  
+    // create Build Action  stage
     const buildAction = new codepipeline_actions.CodeBuildAction({
       actionName: 'Build',
       project: buildProject,
@@ -171,7 +177,7 @@ export class DocumentscodepipelineStack extends cdk.Stack {
     const service = new ecs.Ec2Service(this, 'BroadlumeService001', { 
       cluster, 
       taskDefinition, 
-      desiredCount:1,
+      desiredCount:0, //(desirecount zero then on console task up to 1)
       serviceName: 'broadlumeService001'
     });
 
